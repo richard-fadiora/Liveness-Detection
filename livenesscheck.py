@@ -1,153 +1,140 @@
+import streamlit as st
 import cv2
 import torch
 import mediapipe as mp
-from collections import deque
-from collections import Counter
+from collections import deque, Counter
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForImageClassification
+import numpy as np
 
+# -----------------------------
+# Constants
+# -----------------------------
 MODEL_ID = "nguyenkhoa/dinov2_Liveness_detection_v2.2.3"
 LIVE_THRESHOLD = 0.75
 SPOOF_THRESHOLD = 0.75
-LABEL_WINDOW_SIZE = 10  # Number of frames to vote over
-label_buffer = deque(maxlen=LABEL_WINDOW_SIZE)
+WINDOW_SIZE = 10            # frames for probability smoothing
+LABEL_WINDOW_SIZE = 10      # frames for majority voting
 
-# Load model
-processor = AutoImageProcessor.from_pretrained(MODEL_ID, use_fast=False)
-model = AutoModelForImageClassification.from_pretrained(MODEL_ID)
-model.eval()
+# -----------------------------
+# Load model (runs once)
+# -----------------------------
+@st.cache_resource
+def load_model():
+    processor = AutoImageProcessor.from_pretrained(MODEL_ID, use_fast=False)
+    model = AutoModelForImageClassification.from_pretrained(MODEL_ID)
+    model.eval()
+    return processor, model
 
-# Face detector
+processor, model = load_model()
+
+# -----------------------------
+# Initialize MediaPipe face detector
+# -----------------------------
 mp_face = mp.solutions.face_detection
-face_detector = mp_face.FaceDetection(
-    model_selection=0,
-    min_detection_confidence=0.6
-)
+face_detector = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.6)
 
 # Labels
 id2label = model.config.id2label
 
-# Webcam
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError("Cannot open webcam")
+# -----------------------------
+# Session state buffers
+# -----------------------------
+if "prob_buffer" not in st.session_state:
+    st.session_state.prob_buffer = deque(maxlen=WINDOW_SIZE)
+if "label_buffer" not in st.session_state:
+    st.session_state.label_buffer = deque(maxlen=LABEL_WINDOW_SIZE)
 
-print("Press Q to quit")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.title("Real-Time Webcam Liveness Detection")
 
-WINDOW_SIZE = 10  # ~0.3 seconds
-prob_buffer = deque(maxlen=WINDOW_SIZE)
+frame_placeholder = st.empty()  # for video display
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+# -----------------------------
+# Webcam stream
+# -----------------------------
+camera_frame = st.camera_input("Look at the camera")
 
-    # Convert to RGB for MediaPipe
+if camera_frame is not None:
+    # Convert frame to OpenCV
+    frame = np.array(Image.open(camera_frame))
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    display_frame = rgb_frame.copy()
 
-    # Detect faces
+    # -----------------------------
+    # Face detection
+    # -----------------------------
     results = face_detector.process(rgb_frame)
-
     face_crop = None
 
     if results.detections:
-        detection = results.detections[0]  # first face
+        detection = results.detections[0]
         bbox = detection.location_data.relative_bounding_box
+        h, w, _ = rgb_frame.shape
 
-        h, w, _ = frame.shape
+        x1 = max(0, int(bbox.xmin * w - 0.2 * bbox.width * w))
+        y1 = max(0, int(bbox.ymin * h - 0.2 * bbox.width * w))
+        x2 = min(w, int((bbox.xmin + bbox.width) * w + 0.2 * bbox.width * w))
+        y2 = min(h, int((bbox.ymin + bbox.height) * h + 0.2 * bbox.width * w))
 
-        x1 = int(bbox.xmin * w)
-        y1 = int(bbox.ymin * h)
-        bw = int(bbox.width * w)
-        bh = int(bbox.height * h)
+        face_crop = rgb_frame[y1:y2, x1:x2]
 
-        x2 = x1 + bw
-        y2 = y1 + bh
+        # Draw bounding box
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+    else:
+        st.session_state.label_buffer.append("NO FACE")
+        st.image(display_frame, caption="No face detected")
+        st.stop()
 
-        # Padding
-        pad = int(0.2 * bw)
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(w, x2 + pad)
-        y2 = min(h, y2 + pad)
+    # -----------------------------
+    # Liveness detection
+    # -----------------------------
+    if face_crop is not None and face_crop.size > 0:
+        pil_image = Image.fromarray(face_crop)
+        inputs = processor(images=pil_image, return_tensors="pt")
 
-        face_crop = frame[y1:y2, x1:x2]
+        with torch.no_grad():
+            outputs = model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=1)[0]
+            st.session_state.prob_buffer.append(probs)
 
-        # Draw face box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+        avg_probs = torch.stack(list(st.session_state.prob_buffer)).mean(dim=0)
+        pred_id = torch.argmax(avg_probs).item()
+        confidence = avg_probs[pred_id].item()
+        raw_label = id2label[pred_id]
 
-    # No face case
-    if face_crop is None or face_crop.size == 0:
+        # Confidence thresholding
+        if raw_label.lower() == "live" and confidence >= LIVE_THRESHOLD:
+            label = "LIVE"
+            color = (0, 255, 0)
+        elif raw_label.lower() == "spoof" and confidence >= SPOOF_THRESHOLD:
+            label = "SPOOF"
+            color = (0, 0, 255)
+        else:
+            label = "UNCERTAIN"
+            color = (0, 255, 255)
+
+        # Multi-frame voting
+        st.session_state.label_buffer.append(label)
+        most_common_label = Counter(st.session_state.label_buffer).most_common(1)[0][0]
+
+        # Draw result
         cv2.putText(
-            frame,
-            "NO FACE DETECTED",
+            display_frame,
+            f"{most_common_label} ({confidence:.2f})",
             (30, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
-            (0, 255, 255),
+            color,
             2
         )
-        cv2.imshow("Webcam Liveness Detection", frame)
 
-        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
-            break
-        continue
+    # Display frame
+    frame_placeholder.image(display_frame, channels="RGB")
 
-    # Convert face to PIL
-    image = Image.fromarray(
-        cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-    )
-
-    # Preprocess
-    inputs = processor(images=image, return_tensors="pt")
-
-    # Inference
-    with torch.no_grad():
-        outputs = model(**inputs)
-        probs = torch.softmax(outputs.logits, dim=1)[0]
-        prob_buffer.append(probs)
-
-    avg_probs = torch.stack(list(prob_buffer)).mean(dim=0)
-    pred_id = torch.argmax(avg_probs).item()
-    confidence = avg_probs[pred_id].item()
-    raw_label = id2label[pred_id]
-
-    if raw_label.lower() == "live" and confidence >= LIVE_THRESHOLD:
-        label = "LIVE"
-        color = (0, 255, 0)
-
-    elif raw_label.lower() == "spoof" and confidence >= SPOOF_THRESHOLD:
-        label = "SPOOF"
-        color = (0, 0, 255)
-
-    else:
-        label = "UNCERTAIN"
-        color = (0, 255, 255)
-
-    label_buffer.append(label)
-
-    if len(label_buffer) > 0:
-        most_common_label = Counter(label_buffer).most_common(1)[0][0]
-    else:
-        most_common_label = label  # fallback
-
-    # Draw liveness result
-    text = f"{most_common_label.upper()} ({confidence:.2f})"
-
-    cv2.putText(
-        frame,
-        text,
-        (30, 80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        color,
-        2
-    )
-
-    cv2.imshow("Webcam Liveness Detection", frame)
-
-    if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+    # -----------------------------
+    # Auto-refresh
+    # -----------------------------
+    st.experimental_rerun()  # Automatically fetch new frame
