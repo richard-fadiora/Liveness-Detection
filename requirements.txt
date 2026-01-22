@@ -1,0 +1,10 @@
+streamlit
+cv2
+torch
+mediapipe
+deque
+Counter
+Image
+AutoImageProcessor
+AutoModelForImageClassification
+numpy
