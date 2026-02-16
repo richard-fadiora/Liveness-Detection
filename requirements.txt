@@ -12,5 +12,7 @@ typing-extensions
 onnxruntime==1.23.2
 scipy==1.11.1
 tqdm==4.66.1
+huggingface_hub==0.23.4
+
 
 
