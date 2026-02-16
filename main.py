@@ -80,10 +80,13 @@ class LivenessSDK_Brain:
         
         return True, "OK"
 
-brain = LivenessSDK_Brain()
+brain = None
 
 @app.post("/v1/verify")
 async def verify(files: List[UploadFile] = File(...)):
+    global brain
+    if brain is None:
+        brain = LivenessSDK_Brain()
     cv_frames = []
     for file in files:
         nparr = np.frombuffer(await file.read(), np.uint8)
