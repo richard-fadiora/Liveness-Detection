@@ -80,8 +80,52 @@ class LivenessSDK_Brain:
         
         return True, "OK"
 
-brain = None
+brain = LivenessSDK_Brain()
 
 @app.post("/v1/verify")
-async def verify():
-    return {"status": "ok"}
+async def verify(files: List[UploadFile] = File(...)):
+    cv_frames = []
+    for file in files:
+        nparr = np.frombuffer(await file.read(), np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is not None:
+            # We need RGB for both the Model and the Texture check
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            cv_frames.append(img_rgb)
+
+    if not cv_frames:
+        return {"is_live": False, "reason": "NO_IMAGE_DATA"}
+
+    # 1. Texture & Glare Check (Passive Defense)
+    tex_ok, tex_msg = brain.check_glare_and_texture(cv_frames[-1])
+    if not tex_ok:
+        return {"is_live": False, "reason": tex_msg, "status": "fail"}
+
+    # 2. Motion Check (Catching static spoofs)
+    motion_ok, motion_msg = brain.check_motion_coherence(cv_frames)
+    if not motion_ok:
+        return {"is_live": False, "reason": motion_msg, "status": "fail"}
+
+    # 3. AI Model Inference
+    tensors = [brain.transform(Image.fromarray(f)) for f in cv_frames]
+    batch = torch.stack(tensors).unsqueeze(0).to(brain.device) 
+
+    with torch.no_grad():
+        logits = brain.model(batch)
+        # We take the sigmoid of the logits to get 0.0 to 1.0
+        scores = torch.sigmoid(logits)
+        # Take the maximum or average score of the batch
+        skin_score = torch.mean(scores).item()
+
+    print(f"--- FINAL DECISION ---")
+    print(f"Skin Score: {skin_score}")
+
+    # Threshold: High for security, lower if you get too many false rejections
+    is_live = skin_score > 0.75 
+
+    return {
+        "is_live": is_live,
+        "skin_confidence": round(skin_score, 4),
+        "status": "success",
+        "reason": "OK" if is_live else "AI_SPOOF_DETECTION"
+    }
